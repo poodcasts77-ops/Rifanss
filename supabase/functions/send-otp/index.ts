@@ -1,0 +1,158 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+const SITE_NAME = 'ريفانس المالية';
+const SENDER_DOMAIN = 'notify.rifans.net';
+const FROM_ADDRESS = `${SITE_NAME} <noreply@${SENDER_DOMAIN}>`;
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
+  }
+
+  try {
+    const { email, userId, phone } = await req.json();
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return new Response(JSON.stringify({ success: false, error: 'يرجى إدخال بريد إلكتروني صحيح' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const code = Math.floor(1000 + Math.random() * 9000).toString();
+
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    if (!supabaseUrl || !supabaseServiceKey) throw new Error('Server configuration missing');
+
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+    // Use email as the lookup key (stored in `phone` column for backward compatibility)
+    const key = email.toLowerCase();
+    await supabase.from('otp_codes').delete().eq('phone', key);
+
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    const { error: insertError } = await supabase.from('otp_codes').insert({
+      phone: key,
+      code,
+      user_id: userId && userId !== 'pending' ? userId : null,
+      expires_at: expiresAt,
+    });
+
+    if (insertError) {
+      console.error('OTP insert error:', insertError);
+      return new Response(JSON.stringify({ success: false, error: 'خطأ في حفظ رمز التحقق' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const html = `
+      <div dir="rtl" style="font-family: Tahoma, Arial, sans-serif; background:#ffffff; padding:16px; max-width:480px; margin:auto; color:#22042C;">
+        <div style="text-align:center; padding:12px 0 14px; border-bottom:2px solid #C7A969;">
+          <img src="https://rifanss.com/rifans-logo.png" alt="ريفانس المالية" style="height:64px; width:auto; display:inline-block;" />
+        </div>
+        <div style="padding:18px 6px;">
+          <h2 style="color:#22042C; font-size:14px; margin:0 0 8px;">رمز التحقق الخاص بك</h2>
+          <p style="font-size:11px; color:#444; line-height:1.6; margin:0 0 14px;">
+            مرحبًا، استخدم الرمز التالي لإكمال تسجيل الدخول إلى حسابك:
+          </p>
+          <div style="text-align:center; background:#22042C; color:#C7A969; font-size:24px; font-weight:bold; letter-spacing:6px; padding:14px; border-radius:10px; margin:12px 0;">
+            ${code}
+          </div>
+          <p style="font-size:10px; color:#666; line-height:1.6; margin:14px 0 0;">
+            هذا الرمز صالح لمدة <b>5 دقائق</b>. لا تشارك هذا الرمز مع أي شخص حفاظًا على أمان حسابك.
+          </p>
+          <p style="font-size:9px; color:#999; margin:10px 0 0;">
+            إذا لم تطلب هذا الرمز، يمكنك تجاهل هذه الرسالة.
+          </p>
+        </div>
+        <div style="text-align:center; padding:12px; border-top:1px solid #eee; font-size:9px; color:#999;">
+          © ${new Date().getFullYear()} Rifans Finance · جميع الحقوق محفوظة
+        </div>
+      </div>
+    `;
+
+    const messageId = crypto.randomUUID();
+    let unsubscribeToken = crypto.randomUUID();
+
+    // Reuse existing token for this email if present (unique constraint on email)
+    const { data: existingToken } = await supabase
+      .from('email_unsubscribe_tokens')
+      .select('token')
+      .eq('email', key)
+      .maybeSingle();
+
+    if (existingToken?.token) {
+      unsubscribeToken = existingToken.token;
+    } else {
+      const { error: unsubscribeError } = await supabase
+        .from('email_unsubscribe_tokens')
+        .insert({ token: unsubscribeToken, email: key });
+      if (unsubscribeError && unsubscribeError.code !== '23505') {
+        console.error('OTP unsubscribe token insert error:', unsubscribeError);
+        return new Response(JSON.stringify({ success: false, error: 'فشل تجهيز رسالة التحقق' }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    await supabase.from('email_send_log').insert({
+      message_id: messageId,
+      template_name: 'otp_email',
+      recipient_email: email,
+      status: 'pending',
+    });
+
+    const { error: enqueueError } = await supabase.rpc('enqueue_email', {
+      queue_name: 'transactional_emails',
+      payload: {
+        message_id: messageId,
+        to: email,
+        from: FROM_ADDRESS,
+        sender_domain: SENDER_DOMAIN,
+        subject: `رمز التحقق: ${code} - ريفانس المالية`,
+        html,
+        text: `رمز التحقق الخاص بك في ريفانس المالية: ${code}\n\nهذا الرمز صالح لمدة 5 دقائق. لا تشاركه مع أي شخص.\n\nإذا لم تطلب هذا الرمز، تجاهل هذه الرسالة.`,
+        purpose: 'transactional',
+        label: 'otp_email',
+        unsubscribe_token: unsubscribeToken,
+        idempotency_key: `otp-${key}-${messageId}`,
+        queued_at: new Date().toISOString(),
+      },
+    });
+
+    if (enqueueError) {
+      console.error('OTP email enqueue error:', enqueueError);
+      await supabase.from('email_send_log').insert({
+        message_id: messageId,
+        template_name: 'otp_email',
+        recipient_email: email,
+        status: 'failed',
+        error_message: 'Failed to enqueue OTP email',
+      });
+      return new Response(JSON.stringify({ success: false, error: 'فشل إرسال رمز التحقق إلى البريد الإلكتروني' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    return new Response(JSON.stringify({ success: true, messageId }), {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (err) {
+    console.error('send-otp error:', err);
+    return new Response(JSON.stringify({ success: false, error: 'خطأ في الخادم' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+});
